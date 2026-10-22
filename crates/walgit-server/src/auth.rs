@@ -365,6 +365,9 @@ pub struct Authenticator {
     allowed_domains: Vec<String>,
     allowed_emails: Vec<String>,
     trusted_forwarders: Vec<String>,
+    /// Every configured static token's principal, lowercased, whether or not its secret
+    /// resolved: robot identities that only their own token authenticates.
+    token_principals: Vec<String>,
     admin_emails: Vec<String>,
     admin_domains: Vec<String>,
     /// Accepted `aud` of bearer ID tokens (`audiences` ∪ `oauth_client_id`).
@@ -429,6 +432,11 @@ impl Authenticator {
                 .trusted_forwarders
                 .iter()
                 .map(|v| v.to_ascii_lowercase())
+                .collect(),
+            token_principals: auth
+                .tokens
+                .iter()
+                .map(|t| t.principal.to_ascii_lowercase())
                 .collect(),
             admin_emails: auth
                 .admin_emails
@@ -618,6 +626,12 @@ impl Authenticator {
         Ok(p)
     }
 
+    /// `X-Walgit-Principal` is honoured from a trusted forwarder that has write (or in
+    /// `mode = none`) and ignored from anyone else. The forwarded identity keeps the
+    /// forwarder's write; its admin comes only from `admin_emails`/`admin_domains`.
+    /// It may never name a static token's principal: a robot identity is authenticated
+    /// by its own token alone, so such a forward is refused (`Forbidden`) rather than
+    /// served as the forwarder or as the robot.
     async fn authenticate_with_forwarding(
         &self,
         headers: &HeaderMap,
@@ -638,6 +652,14 @@ impl Authenticator {
                     .iter()
                     .any(|f| f.eq_ignore_ascii_case(&caller.name)))
         {
+            if self.is_token_principal(forwarded) {
+                tracing::warn!(
+                    forwarder = %caller.name,
+                    forwarded,
+                    "forwarded principal names a static token's principal; refused"
+                );
+                return Err(AuthError::Forbidden);
+            }
             return Ok(Principal {
                 name: forwarded.to_string(),
                 write: caller.write,
@@ -724,6 +746,10 @@ impl Authenticator {
         }
     }
 
+    /// Admin of an identity known only by name (an email, a forwarded principal): the
+    /// `admin_emails`/`admin_domains` lists. A static token's `admin` belongs to the token
+    /// and is granted only to a request presenting it ([`Self::opaque_token_principal`]),
+    /// never to a name that happens to match its principal.
     fn is_admin(&self, name: &str) -> bool {
         if self.mode == AuthMode::None {
             return true;
@@ -732,14 +758,16 @@ impl Authenticator {
         if self.admin_emails.iter().any(|e| e == &lower) {
             return true;
         }
-        if let Some((_, domain)) = lower.rsplit_once('@')
-            && self.admin_domains.iter().any(|d| d == domain)
-        {
-            return true;
-        }
-        self.tokens
-            .iter()
-            .any(|t| t.admin && t.principal.eq_ignore_ascii_case(name))
+        lower
+            .rsplit_once('@')
+            .is_some_and(|(_, domain)| self.admin_domains.iter().any(|d| d == domain))
+    }
+
+    /// Whether `name` is a configured static token's principal (ASCII case-insensitive,
+    /// as policy matches principals).
+    fn is_token_principal(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        self.token_principals.iter().any(|p| p == &lower)
     }
 
     /// Require read access: anonymous read only when `anonymous_read` allows it.
@@ -1214,6 +1242,157 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         cfg.server.auth.trusted_forwarders.clear();
         let auth = Authenticator::new(&cfg);
         assert_eq!(auth.authenticate(&headers).await.unwrap().name, "front");
+    }
+
+    /// Two trusted forwarders and a robot admin token that cannot push, as a control plane
+    /// with a separate deletion credential deploys them.
+    fn forwarding_config() -> walgit_config::Config {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.anonymous_read = false;
+        cfg.server.auth.tokens = vec![
+            static_token("front", "front-secret", true),
+            static_token("cp", "cp-secret", true),
+            StaticToken {
+                admin: true,
+                ..static_token("robots/purge-admin", "admin-secret", false)
+            },
+        ];
+        cfg.server.auth.trusted_forwarders = vec!["front".into(), "cp".into()];
+        cfg.server.auth.admin_emails = vec!["Root@Example.com".into()];
+        cfg.server.auth.admin_domains = vec!["ops.example.com".into()];
+        cfg
+    }
+
+    fn forwarded(tok: &str, principal: &str) -> HeaderMap {
+        let mut h = bearer(tok);
+        h.insert("x-walgit-principal", principal.parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn a_forwarder_cannot_assert_a_static_token_principal() {
+        let auth = Authenticator::new(&forwarding_config());
+        for (tok, name) in [
+            ("cp-secret", "robots/purge-admin"),
+            ("front-secret", "robots/purge-admin"),
+            ("cp-secret", "ROBOTS/Purge-Admin"),
+            ("cp-secret", " robots/purge-admin "),
+            ("front-secret", "cp"),
+            ("cp-secret", "cp"),
+        ] {
+            let h = forwarded(tok, name);
+            assert!(
+                matches!(auth.authenticate(&h).await, Err(AuthError::Forbidden)),
+                "{tok} forwarding {name:?} must be refused"
+            );
+            assert!(
+                matches!(auth.require_admin(&h).await, Err(AuthError::Forbidden)),
+                "{tok} forwarding {name:?} must not be admin"
+            );
+        }
+        // The forwarders alone are not admin either.
+        assert!(matches!(
+            auth.require_admin(&bearer("cp-secret")).await,
+            Err(AuthError::Forbidden)
+        ));
+
+        // A caller that may not forward is still just itself: the header is ignored.
+        let p = auth
+            .authenticate(&forwarded("admin-secret", "someone-else"))
+            .await
+            .unwrap();
+        assert_eq!(p.name, "robots/purge-admin");
+
+        // A token principal whose secret did not resolve is reserved all the same.
+        let mut cfg = forwarding_config();
+        cfg.server
+            .auth
+            .tokens
+            .push(static_token("dormant", "", true));
+        let auth = Authenticator::new(&cfg);
+        assert!(matches!(
+            auth.authenticate(&forwarded("cp-secret", "dormant")).await,
+            Err(AuthError::Forbidden)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_admin_token_presented_directly_is_admin() {
+        let auth = Authenticator::new(&forwarding_config());
+        let p = auth.require_admin(&bearer("admin-secret")).await.unwrap();
+        assert_eq!(
+            (p.name.as_str(), p.write, p.admin),
+            ("robots/purge-admin", false, true)
+        );
+        let p = auth
+            .require_admin(&basic("git", "admin-secret"))
+            .await
+            .unwrap();
+        assert!(p.admin);
+        assert!(matches!(
+            auth.require_write(&bearer("admin-secret")).await,
+            Err(AuthError::Forbidden)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_user_keeps_the_forwarders_write_and_gets_no_admin() {
+        let auth = Authenticator::new(&forwarding_config());
+        let h = forwarded("cp-secret", "usr_123");
+        let p = auth.require_write(&h).await.unwrap();
+        assert_eq!(
+            (p.name.as_str(), p.write, p.admin, p.anonymous),
+            ("usr_123", true, false, false)
+        );
+        assert!(matches!(
+            auth.require_admin(&h).await,
+            Err(AuthError::Forbidden)
+        ));
+    }
+
+    #[tokio::test]
+    async fn forwarded_admin_comes_only_from_admin_emails_and_domains() {
+        let auth = Authenticator::new(&forwarding_config());
+        for name in [
+            "root@example.com",
+            "ROOT@example.COM",
+            "anyone@ops.example.com",
+        ] {
+            let p = auth
+                .require_admin(&forwarded("front-secret", name))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!((p.name.as_str(), p.write, p.admin), (name, true, true));
+        }
+        for name in [
+            "user@example.com",
+            "root@example.com.evil",
+            "ops.example.com",
+        ] {
+            let p = auth
+                .authenticate(&forwarded("front-secret", name))
+                .await
+                .unwrap();
+            assert!(!p.admin, "{name} is not an admin");
+        }
+    }
+
+    /// An ID token whose email equals an admin token's principal is that email, not the
+    /// token: admin needs the token itself or `admin_emails`/`admin_domains`.
+    #[tokio::test]
+    async fn an_oidc_email_named_like_an_admin_token_is_not_admin() {
+        let mut cfg = config();
+        cfg.server.auth.tokens = vec![StaticToken {
+            admin: true,
+            ..static_token("bot@example.com", "r0bot", false)
+        }];
+        let auth = Authenticator::with_key_source(&cfg, source());
+        let h = bearer(&token("bot@example.com", ISSUER, AUD, 4_000_000_000, true));
+        let p = auth.authenticate(&h).await.unwrap();
+        assert_eq!(p.name, "bot@example.com");
+        assert!(!p.admin);
+        assert!(auth.require_admin(&bearer("r0bot")).await.unwrap().admin);
     }
 
     #[tokio::test]

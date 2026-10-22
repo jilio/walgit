@@ -560,6 +560,117 @@ async fn repository_delete_requires_admin() -> TestResult {
     Ok(())
 }
 
+/// A trusted forwarder names end users, never robots: forwarding a static token's
+/// principal is refused instead of borrowing that token's admin, a forwarded user
+/// keeps the forwarder's write without admin, admin emails still forward as admin,
+/// and the admin token presented directly still deletes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarder_cannot_borrow_a_static_tokens_admin() -> TestResult {
+    let token =
+        |principal: &str, token: &str, write: bool, admin: bool| walgit_config::StaticToken {
+            principal: principal.into(),
+            token: token.into(),
+            token_env: None,
+            write,
+            admin,
+        };
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![
+            token("front", "front-token", true, false),
+            token("cp", "cp-token", true, false),
+            token("robots/purge-admin", "admin-token", false, true),
+        ];
+        c.server.auth.trusted_forwarders = vec!["front".into(), "cp".into()];
+        c.server.auth.admin_emails = vec!["root@example.com".into()];
+    })
+    .await?;
+    let cp = [("Authorization", "Bearer cp-token")];
+    let admin = [("Authorization", "Bearer admin-token")];
+    let as_cp = |principal: &'static str| {
+        [
+            ("Authorization", "Bearer cp-token"),
+            ("X-Walgit-Principal", principal),
+        ]
+    };
+
+    assert_eq!(
+        req(&server, reqwest::Method::PUT, "/purged/app/api", &cp)
+            .await?
+            .0,
+        201
+    );
+    for principal in ["robots/purge-admin", "Robots/Purge-Admin", "front"] {
+        for method in [reqwest::Method::DELETE, reqwest::Method::GET] {
+            assert_eq!(
+                req(
+                    &server,
+                    method.clone(),
+                    "/purged/app/api",
+                    &as_cp(principal)
+                )
+                .await?
+                .0,
+                403,
+                "{method} as cp forwarding {principal}"
+            );
+        }
+    }
+    for headers in [&cp[..], &as_cp("usr_123")[..]] {
+        assert_eq!(
+            req(&server, reqwest::Method::DELETE, "/purged/app/api", headers)
+                .await?
+                .0,
+            403,
+            "write without admin must not delete"
+        );
+    }
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/purged/app/api", &cp)
+            .await?
+            .0,
+        200,
+        "refused deletions leave the repository intact"
+    );
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::PUT,
+            "/purged/other/api",
+            &as_cp("usr_123")
+        )
+        .await?
+        .0,
+        201,
+        "a forwarded user keeps the forwarder's write"
+    );
+
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::DELETE,
+            "/purged/other/api",
+            &as_cp("root@example.com")
+        )
+        .await?
+        .0,
+        204,
+        "a forwarded admin email is admin"
+    );
+    assert_eq!(
+        req(&server, reqwest::Method::DELETE, "/purged/app/api", &admin)
+            .await?
+            .0,
+        204,
+        "the admin token itself deletes"
+    );
+    for path in ["/purged/app/api", "/purged/other/api"] {
+        assert_eq!(req(&server, reqwest::Method::GET, path, &cp).await?.0, 404);
+    }
+    Ok(())
+}
+
 /// D24 and API.md §5: on the JSON surface a write token creates repositories,
 /// but the policy and settings documents move only with admin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
