@@ -165,7 +165,9 @@ pub struct AuthConfig {
     pub write_domains: Option<Vec<String>>,
     /// Principals allowed to forward an end-user identity (`X-Walgit-Principal`) to this
     /// server — the host that fronts a push broker. Names as they authenticate here (a static
-    /// token's `principal`, or an email).
+    /// token's `principal`, or an email). A forwarded identity keeps the forwarder's write,
+    /// is admin only through `admin_emails`/`admin_domains`, and may never name a static
+    /// token's `principal` (refused with 403: only that token authenticates it).
     pub trusted_forwarders: Vec<String>,
     /// OIDC emails that may PUT/DELETE settings and `policy.json`. Empty = none via email.
     #[serde(default)]

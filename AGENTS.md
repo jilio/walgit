@@ -104,7 +104,9 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   `/services/setup.json`); the Clone menu, API page, overview and git error help render them.
 - **Host to host**: a front that forwards pushes to a broker presents `wal.push_broker_token` (or
   `WALGIT_BROKER_TOKEN`); the broker lists it in `tokens` and its principal in `trusted_forwarders`, so the end
-  user travels in `X-Walgit-Principal`.
+  user travels in `X-Walgit-Principal`. A forwarded identity keeps the forwarder's write, is admin only via
+  `admin_emails`/`admin_domains`, and never names a static token's principal (403: a robot is authenticated by
+  its own token alone).
 - Tests never write the user's global git config (private `GIT_CONFIG_GLOBAL`, `tests/lib-auth.sh`).
 
 ### 1.4 Requirements (the bar)
